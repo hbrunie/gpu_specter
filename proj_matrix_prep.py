@@ -21,88 +21,143 @@ import math
 import numba
 import cupy as cp
 import cupyx as cpx
+import cupyx.scipy.special
 from numba import cuda
 
-#import matplotlib.pyplot as plt
+def native_endian(data):
+    """Temporary function, sourced from desispec.io
+    Convert numpy array data to native endianness if needed.
+    Returns new array if endianness is swapped, otherwise returns input data
+    Context:
+    By default, FITS data from astropy.io.fits.getdata() are not Intel
+    native endianness and scipy 0.14 sparse matrices have a bug with
+    non-native endian data.
+    """
+    if data.dtype.isnative:
+        return data
+    else:
+        return data.byteswap().newbyteorder()
 
+
+@cuda.jit
+def legvander(x, deg, output_matrix):
+    i = cuda.grid(1)
+    stride = cuda.gridsize(1)
+    for i in range(i, x.shape[0], stride):
+        output_matrix[i][0] = 1
+        output_matrix[i][1] = x[i]
+        for j in range(2, deg + 1):
+            output_matrix[i][j] = (output_matrix[i][j-1]*x[i]*(2*j - 1) - output_matrix[i][j-2]*(j - 1)) / j
+
+def legvander_wrapper(x, deg):
+    """Temporary wrapper that allocates memory and defines grid before calling legvander.
+    Probably won't be needed once cupy has the correpsponding legvander function.
+    Input: Same as cpu version of legvander
+    Output: legvander matrix, cp.ndarray
+    """
+    output = cp.ndarray((len(x), deg + 1))
+    blocksize = 256
+    numblocks = (len(x) + blocksize - 1) // blocksize
+    legvander[numblocks, blocksize](x, deg, output)
+    return output
 
 def evalcoeffs(wavelengths, psfdata):
     '''
     wavelengths: 1D array of wavelengths to evaluate all coefficients for all wavelengths of all spectra
     psfdata: Table of parameter data ready from a GaussHermite format PSF file
-    
     Returns a dictionary params[paramname] = value[nspec, nwave]
-    
     The Gauss Hermite coefficients are treated differently:
-    
         params['GH'] = value[i,j,nspec,nwave]
-        
     The dictionary also contains scalars with the recommended spot size HSIZEX, HSIZEY
     and Gauss-Hermite degrees GHDEGX, GHDEGY (which is also derivable from the dimensions
     of params['GH'])
     '''
+    # Initialization
     wavemin, wavemax = psfdata['WAVEMIN'][0], psfdata['WAVEMAX'][0]
     wx = (wavelengths - wavemin) * (2.0 / (wavemax - wavemin)) - 1.0
-    L = np.polynomial.legendre.legvander(wx, psfdata.meta['LEGDEG'])
-    
-    p = dict(WAVE=wavelengths)
+
+    L = legvander_wrapper(wx, psfdata.meta['LEGDEG'])
+    p = dict(WAVE=wavelengths) # p doesn't live on the gpu, but it's last-level values do
     nparam, nspec, ndeg = psfdata['COEFF'].shape
     nwave = L.shape[0]
-    p['GH'] = np.zeros((psfdata.meta['GHDEGX']+1, psfdata.meta['GHDEGY']+1, nspec, nwave))
+
+    # Init zeros
+    p['GH'] = cp.zeros((psfdata.meta['GHDEGX']+1, psfdata.meta['GHDEGY']+1, nspec, nwave))
+    # Init gpu coeff
+    coeff_gpu = cp.array(native_endian(psfdata['COEFF']))
+
+    k = 0
     for name, coeff in zip(psfdata['PARAM'], psfdata['COEFF']):
         name = name.strip()
         if name.startswith('GH-'):
             i, j = map(int, name.split('-')[1:3])
-            p['GH'][i,j] = L.dot(coeff.T).T
+            p['GH'][i,j] = L.dot(coeff_gpu[k].T).T
         else:
-            p[name] = L.dot(coeff.T).T
-    
+            p[name] = L.dot(coeff_gpu[k].T).T
+        k += 1
+
     #- Include some additional keywords that we'll need
     for key in ['HSIZEX', 'HSIZEY', 'GHDEGX', 'GHDEGY']:
         p[key] = psfdata.meta[key]
-    
+
     return p
+
+
+@cuda.jit
+def hermevander(x, deg, output_matrix):
+    i = cuda.blockIdx.x
+    _, j = cuda.grid(2)
+    _, stride = cuda.gridsize(2)
+    for j in range(j, x.shape[1], stride):
+        output_matrix[i][j][0] = 1
+        if deg > 0:
+            output_matrix[i][j][1] = x[i][j]
+            for k in range(2, deg + 1):
+                output_matrix[i][j][k] = output_matrix[i][j][k-1]*x[i][j] - output_matrix[i][j][k-2]*(k-1)
+
+def hermevander_wrapper(x, deg):
+    """Temprorary wrapper that allocates memory and calls hermevander_gpu
+    """
+    if x.ndim == 1:
+        x = cp.expand_dims(x, 0)
+    output = cp.ndarray(x.shape + (deg+1,))
+    blocksize = 256
+    numblocks = (x.shape[0], (x.shape[1] + blocksize - 1) // blocksize)
+    hermevander[numblocks, blocksize](x, deg, output)
+    return cp.squeeze(output)
 
 
 def calc_pgh(ispec, wavelengths, psfparams):
     '''
     Calculate the pixelated Gauss Hermite for all wavelengths of a single spectrum
-    
     ispec : integer spectrum number
     wavelengths : array of wavelengths to evaluate
     psfparams : dictionary of PSF parameters returned by evalcoeffs
-    
     returns pGHx, pGHy
-    
     where pGHx[ghdeg+1, nwave, nbinsx] contains the pixel-integrated Gauss-Hermite polynomial
     for all degrees at all wavelengths across nbinsx bins spaning the PSF spot, and similarly
     for pGHy.  The core PSF will then be evaluated as
-    
     PSFcore = sum_ij c_ij outer(pGHy[j], pGHx[i])
     '''
-    
+
     #- shorthand
     p = psfparams
-    
+
     #- spot size (ny,nx)
     nx = p['HSIZEX']
     ny = p['HSIZEY']
     nwave = len(wavelengths)
-    # print('Spot size (ny,nx) = {},{}'.format(ny, nx))
-    # print('nwave = {}'.format(nwave))
+    p['X'], p['Y'], p['GHSIGX'], p['GHSIGY'] = \
+    cp.array(p['X']), cp.array(p['Y']), cp.array(p['GHSIGX']), cp.array(p['GHSIGY'])
+    xedges = cp.repeat(cp.arange(nx+1) - nx//2, nwave).reshape(nx+1, nwave)
+    yedges = cp.repeat(cp.arange(ny+1) - ny//2, nwave).reshape(ny+1, nwave)
 
-    #- x and y edges of bins that span the center of the PSF spot
-    xedges = np.repeat(np.arange(nx+1) - nx//2, nwave).reshape(nx+1, nwave)
-    yedges = np.repeat(np.arange(ny+1) - ny//2, nwave).reshape(ny+1, nwave)
-    
     #- Shift to be relative to the PSF center at 0 and normalize
     #- by the PSF sigma (GHSIGX, GHSIGY)
     #- xedges[nx+1, nwave]
     #- yedges[ny+1, nwave]
-    xedges = ((xedges - p['X'][ispec]%1)/p['GHSIGX'][ispec])
-    yedges = ((yedges - p['Y'][ispec]%1)/p['GHSIGY'][ispec])    
-#     print('xedges.shape = {}'.format(xedges.shape))
-#     print('yedges.shape = {}'.format(yedges.shape))
+    xedges = (xedges - p['X'][ispec]%1)/p['GHSIGX'][ispec]
+    yedges = (yedges - p['Y'][ispec]%1)/p['GHSIGY'][ispec]
 
     #- Degree of the Gauss-Hermite polynomials
     ghdegx = p['GHDEGX']
@@ -111,18 +166,14 @@ def calc_pgh(ispec, wavelengths, psfparams):
     #- Evaluate the Hermite polynomials at the pixel edges
     #- HVx[ghdegx+1, nwave, nx+1]
     #- HVy[ghdegy+1, nwave, ny+1]
-    HVx = He.hermevander(xedges, ghdegx).T
-    HVy = He.hermevander(yedges, ghdegy).T
-    # print('HVx.shape = {}'.format(HVx.shape))
-    # print('HVy.shape = {}'.format(HVy.shape))
+    HVx = hermevander_wrapper(xedges, ghdegx).T
+    HVy = hermevander_wrapper(yedges, ghdegy).T
 
     #- Evaluate the Gaussians at the pixel edges
     #- Gx[nwave, nx+1]
     #- Gy[nwave, ny+1]
-    Gx = np.exp(-0.5*xedges**2).T / np.sqrt(2. * np.pi)   # (nwave, nedges)
-    Gy = np.exp(-0.5*yedges**2).T / np.sqrt(2. * np.pi)
-    # print('Gx.shape = {}'.format(Gx.shape))
-    # print('Gy.shape = {}'.format(Gy.shape))
+    Gx = cp.exp(-0.5*xedges**2).T / cp.sqrt(2. * cp.pi)
+    Gy = cp.exp(-0.5*yedges**2).T / cp.sqrt(2. * cp.pi)
 
     #- Combine into Gauss*Hermite
     GHx = HVx * Gx
@@ -133,14 +184,12 @@ def calc_pgh(ispec, wavelengths, psfparams):
 
     #- pGHx[ghdegx+1, nwave, nx]
     #- pGHy[ghdegy+1, nwave, ny]
-    pGHx = np.zeros((ghdegx+1, nwave, nx))
-    pGHy = np.zeros((ghdegy+1, nwave, ny))
-    pGHx[0] = 0.5 * np.diff(scipy.special.erf(xedges/np.sqrt(2.)).T)
-    pGHy[0] = 0.5 * np.diff(scipy.special.erf(yedges/np.sqrt(2.)).T)
+    pGHx = cp.zeros((ghdegx+1, nwave, nx))
+    pGHy = cp.zeros((ghdegy+1, nwave, ny))
+    pGHx[0] = 0.5 * cp.diff(cupyx.scipy.special.erf(xedges/cp.sqrt(2.)).T)
+    pGHy[0] = 0.5 * cp.diff(cupyx.scipy.special.erf(yedges/cp.sqrt(2.)).T)
     pGHx[1:] = GHx[:ghdegx,:,0:nx] - GHx[:ghdegx,:,1:nx+1]
     pGHy[1:] = GHy[:ghdegy,:,0:ny] - GHy[:ghdegy,:,1:ny+1]
-    # print('pGHx.shape = {}'.format(pGHx.shape))
-    # print('pGHy.shape = {}'.format(pGHy.shape))
     
     return pGHx, pGHy
 
@@ -172,24 +221,16 @@ def multispot(pGHx, pGHy, ghc, mspots):
                     for ix in range(len(px)):
                         mspots[iwave, iy, ix] += c * py[iy] * px[ix]
 
-
-@cuda.jit()
-def projection_matrix(A, xc, yc, ispec, iwave, nspec, nwave, xmin, ymin, spots):
-    #this is the heart of the projection matrix calculation
-
-    i, j = cuda.grid(2)
-
-    #no loops, just a boundary check
-    if (0 <= i < nspec) and (0 <= j <nwave):
-        ixc = xc[ispec+i, iwave+j] - xmin
-        iyc = yc[ispec+i, iwave+j] - ymin
-        #A[iyc:iyc+ny, ixc:ixc+nx, i, j] = spots[ispec+i,iwave+j]
-        #this fancy indexing is not allowed in numba gpu (although it is in numba cpu...)
-        #try this instead
-        for iy, y in enumerate(range(iyc,iyc+ny)):
-            for ix, x in enumerate(range(ixc,ixc+nx)):
-                temp_spot = spots[ispec+i, iwave+j][iy, ix]
-                A[y, x, i, j] = temp_spot
+#no numba for now, contains cupy and some cpu code still
+def cache_spots(nx, ny, nspec, nwave, p, wavelengths):
+    spots = cp.zeros((nspec, nwave, ny, nx))
+    mspots = cp.zeros((nwave, ny, nx))
+    for ispec in range(nspec):
+        pGHx, pGHy = calc_pgh(ispec, wavelengths, p)
+        ghc = p['GH'][:,:,ispec,:]
+        multispot[blocks_per_grid, threads_per_block](pGHx, pGHy, ghc, mspots)
+        spots[ispec] = mspots
+    return spots.get()
 
 #- Read the PSF parameters from a PSF file without using specter
 psfdata = Table.read('psf.fits')
@@ -209,74 +250,16 @@ p = evalcoeffs(wavelengths, psfdata)
 nx = p['HSIZEX']
 ny = p['HSIZEY']
 
+#xc and yc are cupy core arrays
 xc = np.floor(p['X'] - p['HSIZEX']//2).astype(int)
 yc = np.floor(p['Y'] - p['HSIZEY']//2).astype(int)
-corners = (xc, yc)
 
-#preallocate
-spots = np.zeros((nspec, nwave, ny, nx))
-mspots = np.zeros((nwave, ny, nx)) 
 
 #gpu stuff (for v100, total number of threads per multiprocessor = 2048)
 #max threads per block is 1024
-
 #this is a 1d kernel for multispot
 threads_per_block = 64
 blocks_per_grid = 4
 
-for ispec in range(nspec):
-    #second function, contains hermvander
-    pGHx, pGHy = calc_pgh(ispec, wavelengths,p)
-    #solve numba continguous array error
-    ghc = p['GH'][:,:,ispec,:]
-    ghc_contig = np.ascontiguousarray(ghc)
-    #try to handle the HtD and DtH ourselves with CuPy
-    pGHx_gpu = cp.asarray(pGHx)
-    pGHy_gpu = cp.asarray(pGHy)
-    ghc_contig_gpu = cp.asarray(ghc_contig)
-    mspots_gpu = cp.asarray(mspots)
-    #launch the GPU kernel
-    multispot[blocks_per_grid, threads_per_block](pGHx_gpu, pGHy_gpu, ghc_contig_gpu, mspots_gpu)
-    #convert mspots back to a cpu function
-    mspots_cpu = mspots_gpu.get()
-    spots[ispec] = mspots_cpu
-    #and do it again
+spots_cache = cache_spots(nx, ny, nspec, nwave, p, wavelengths)
 
-#def projection_matrix(ispec, nspec, iwave, nwave, spots, corners):
-#last function, parent function to all others
-#resides inside of ex2d_patch for now
-ny, nx = spots.shape[2:4]
-xc, yc = corners
-#for now
-ispec = 0
-iwave = 0
-#just do this before we get to gpu land (for now)
-xmin = np.min(xc[ispec:ispec+nspec, iwave:iwave+nwave])
-xmax = np.max(xc[ispec:ispec+nspec, iwave:iwave+nwave]) + nx
-ymin = np.min(yc[ispec:ispec+nspec, iwave:iwave+nwave])
-ymax = np.max(yc[ispec:ispec+nspec, iwave:iwave+nwave]) + ny
-A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
-
-#this is a 2d kernel for projection matrix
-threads_per_block = (16,16) #needs to be 2d!
-#copy from matt who copied from cuda docs
-blocks_per_grid_x = math.ceil(A.shape[0] / threads_per_block[0])
-blocks_per_grid_y = math.ceil(A.shape[1] / threads_per_block[1])
-blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
-
-#let numba do the data transfer work for us
-projection_matrix[blocks_per_grid, threads_per_block](A, xc, yc, ispec, iwave, nspec, nwave, xmin, ymin, spots)
-#actually unless we explicly bring A back I think it stays there?!?!
-#A_cpu = A.get() nope this doesn't work! actually it seems to make the gpu node really unhappy, don't do this...
-
-print(A)
-
-nypix, nxpix = A.shape[0:2]
-Ax = A.reshape(nypix*nxpix, nspec*nwave)
-image = Ax.dot(influx.ravel()).reshape(nypix, nxpix)
-#plt.imshow(image)
-#save image so we can check if we got the right answer....
-np.save('gpu_image.npy', image)
-
-#also save spots
-np.save('gpu_spots.npy', spots)
