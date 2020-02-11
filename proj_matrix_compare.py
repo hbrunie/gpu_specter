@@ -175,6 +175,157 @@ def multispot(pGHx, pGHy, ghc, mspots):
 
 #for comparison here is the cpu version
 @numba.jit(nopython=True)
+def projection_matrix_cpu(A, xc, yc, ispec, nspec, iwave, nwave, spots):
+    ny, nx = spots.shape[2:4]
+    for i in range(nspec):
+        for j in range(nwave):
+            ixc = xc[ispec+i, iwave+j] - xmin
+            iyc = yc[ispec+i, iwave+j] - ymin
+            A[iyc:iyc+ny, ixc:ixc+nx, i, j] = spots[ispec+i,iwave+j]
+
+    return A, ymin, xmin
+
+@cuda.jit()
+def projection_matrix(A, xc, yc, xmin, ymin, ispec, iwave, nspec, nwave, spots):
+    ny, nx = spots.shape[2:4]
+    #this is the magic step
+    i = cuda.grid(1) #loop over nspec
+    #only do 1d to avoid a datarace in 2d
+    if (0 <= i < nspec):
+        for j in range(nwave):
+            ixc = xc[ispec+i, iwave+j] - xmin
+            iyc = yc[ispec+i, iwave+j] - ymin
+            #A[iyc:iyc+ny, ixc:ixc+nx, i, j] = spots[ispec+i,iwave+j]
+            #fancy slicing index not allowed
+            #try to accomplish the same thing with loops
+            for iy, y in enumerate(range(iyc,iyc+ny)):
+                for ix, x in enumerate(range(ixc,ixc+nx)):
+                    temp_spot = spots[ispec+i, iwave+j][iy, ix]
+                    A[y, x, i, j] = temp_spot
+
+
+#this 2d version has a data race i think
+@cuda.jit()
+def projection_matrix2(A, xc, yc, xmin, ymin, ispec, iwave, nspec, nwave, spots):
+    #this is the heart of the projection matrix calculation
+    ny, nx = spots.shape[2:4]
+
+    i, j = cuda.grid(2)
+
+    #no loops, just a boundary check
+    if (0 <= i < nspec) and (0 <= j <nwave):
+        ixc = xc[ispec+i, iwave+j] - xmin
+        iyc = yc[ispec+i, iwave+j] - ymin
+        #A[iyc:iyc+ny, ixc:ixc+nx, i, j] = spots[ispec+i,iwave+j]
+        #this fancy indexing is not allowed in numba gpu (although it is in numba cpu...)
+        #try this instead
+        for iy, y in enumerate(range(iyc,iyc+ny)):
+            for ix, x in enumerate(range(ixc,ixc+nx)):
+                temp_spot = spots[ispec+i, iwave+j][iy, ix]
+                A[y, x, i, j] = temp_spot
+
+
+
+#- Read the PSF parameters from a PSF file without using specter
+psfdata = Table.read('psf.fits')
+
+#- Generate some fake input data
+wavemin, wavemax = 6000., 6050.
+wavelengths = np.arange(wavemin, wavemax)
+nwave = len(wavelengths)
+nspec = 5
+influx = np.zeros((nspec, nwave))
+for i in range(nspec):
+    influx[i, 5*(i+1)] = 100*(i+1)
+
+#first function, contains legvander
+p = evalcoeffs(wavelengths, psfdata)
+
+nx = p['HSIZEX']
+ny = p['HSIZEY']
+
+xc = np.floor(p['X'] - p['HSIZEX']//2).astype(int)
+yc = np.floor(p['Y'] - p['HSIZEY']//2).astype(int)
+corners = (xc, yc)
+
+#preallocate
+spots = np.zeros((nspec, nwave, ny, nx))
+mspots = np.zeros((nwave, ny, nx)) 
+
+#gpu stuff (for v100, total number of threads per multiprocessor = 2048)
+#max threads per block is 1024
+
+#this is a 1d kernel for multispot
+threads_per_block = 64
+blocks_per_grid = 4
+
+
+#def projection_matrix(ispec, nspec, iwave, nwave, spots, corners):
+#last function, parent function to all others
+#resides inside of ex2d_patch for now
+ny, nx = spots.shape[2:4]
+xc, yc = corners
+#for now
+ispec = 0
+iwave = 0
+#just do this before we get to gpu land (for now)
+xmin = np.min(xc[ispec:ispec+nspec, iwave:iwave+nwave])
+xmax = np.max(xc[ispec:ispec+nspec, iwave:iwave+nwave]) + nx
+ymin = np.min(yc[ispec:ispec+nspec, iwave:iwave+nwave])
+ymax = np.max(yc[ispec:ispec+nspec, iwave:iwave+nwave]) + ny
+A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
+
+#this is a 2d kernel for projection matrix
+threads_per_block = (16,16) #needs to be 2d!
+#copy from matt who copied from cuda docs so it's probably legit
+blocks_per_grid_x = math.ceil(A.shape[0] / threads_per_block[0])
+blocks_per_grid_y = math.ceil(A.shape[1] / threads_per_block[1])
+blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+
+#gpu 1
+A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
+xc, yc = corners
+projection_matrix[blocks_per_grid, threads_per_block](A, xc, yc, xmin, ymin, ispec, iwave, nspec, nwave, spots)
+
+A_gpu = A
+print("np.max(A_gpu)", np.max(A_gpu))
+
+#gpu 2
+
+#def projection_matrix(ispec, nspec, iwave, nwave, spots, corners):
+#last function, parent function to all others
+#resides inside of ex2d_patch for now
+ny, nx = spots.shape[2:4]
+xc, yc = corners
+#for now
+ispec = 0
+iwave = 0
+#just do this before we get to gpu land (for now)
+xmin = np.min(xc[ispec:ispec+nspec, iwave:iwave+nwave])
+xmax = np.max(xc[ispec:ispec+nspec, iwave:iwave+nwave]) + nx
+ymin = np.min(yc[ispec:ispec+nspec, iwave:iwave+nwave])
+ymax = np.max(yc[ispec:ispec+nspec, iwave:iwave+nwave]) + ny
+A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
+
+#this is a 2d kernel for projection matrix
+threads_per_block = (16,16) #needs to be 2d!
+#copy from matt who copied from cuda docs so it's probably legit
+blocks_per_grid_x = math.ceil(A.shape[0] / threads_per_block[0])
+blocks_per_grid_y = math.ceil(A.shape[1] / threads_per_block[1])
+blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+
+#gpu 1
+A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
+xc, yc = corners
+projection_matrix2[blocks_per_grid, threads_per_block](A, xc, yc, xmin, ymin, ispec, iwave, nspec, nwave, spots)
+
+A_gpu2 = A
+print("np.max(A_gpu2)", np.max(A_gpu2))
+
+
+#and now cpu
+
+@numba.jit
 def projection_matrix_cpu(ispec, nspec, iwave, nwave, spots, corners):
     '''
     Create the projection matrix A for p = Af
@@ -212,126 +363,9 @@ def projection_matrix_cpu(ispec, nspec, iwave, nwave, spots, corners):
 
     return A, ymin, xmin
 
-#and here is the gpu version
-@cuda.jit()
-def projection_matrix(A, xc, yc, ispec, iwave, nspec, nwave, xmin, ymin, spots):
-    #this is the heart of the projection matrix calculation
+A_cpu, ymin, xmin = projection_matrix_cpu(ispec, nspec, iwave, nwave, spots, corners)
 
-    i, j = cuda.grid(2)
+print("np.max(A_cpu)", np.max(A_cpu))
 
-    #no loops, just a boundary check
-    if (0 <= i < nspec) and (0 <= j <nwave):
-        ixc = xc[ispec+i, iwave+j] - xmin
-        iyc = yc[ispec+i, iwave+j] - ymin
-        #A[iyc:iyc+ny, ixc:ixc+nx, i, j] = spots[ispec+i,iwave+j]
-        #this fancy indexing is not allowed in numba gpu (although it is in numba cpu...)
-        #try this instead
-        for iy, y in enumerate(range(iyc,iyc+ny)):
-            for ix, x in enumerate(range(ixc,ixc+nx)):
-                temp_spot = spots[ispec+i, iwave+j][iy, ix]
-                A[y, x, i, j] = temp_spot
-
-#- Read the PSF parameters from a PSF file without using specter
-psfdata = Table.read('psf.fits')
-
-#- Generate some fake input data
-wavemin, wavemax = 6000., 6050.
-wavelengths = np.arange(wavemin, wavemax)
-nwave = len(wavelengths)
-nspec = 5
-influx = np.zeros((nspec, nwave))
-for i in range(nspec):
-    influx[i, 5*(i+1)] = 100*(i+1)
-
-#first function, contains legvander
-p = evalcoeffs(wavelengths, psfdata)
-
-nx = p['HSIZEX']
-ny = p['HSIZEY']
-
-xc = np.floor(p['X'] - p['HSIZEX']//2).astype(int)
-yc = np.floor(p['Y'] - p['HSIZEY']//2).astype(int)
-corners = (xc, yc)
-
-#preallocate
-spots = np.zeros((nspec, nwave, ny, nx))
-mspots = np.zeros((nwave, ny, nx)) 
-
-#gpu stuff (for v100, total number of threads per multiprocessor = 2048)
-#max threads per block is 1024
-
-#this is a 1d kernel for multispot
-threads_per_block = 64
-blocks_per_grid = 4
-
-for ispec in range(nspec):
-    #second function, contains hermvander
-    pGHx, pGHy = calc_pgh(ispec, wavelengths,p)
-    #solve numba continguous array error
-    ghc = p['GH'][:,:,ispec,:]
-    ghc_contig = np.ascontiguousarray(ghc)
-    #try to handle the HtD and DtH ourselves with CuPy
-    pGHx_gpu = cp.asarray(pGHx)
-    pGHy_gpu = cp.asarray(pGHy)
-    ghc_contig_gpu = cp.asarray(ghc_contig)
-    mspots_gpu = cp.asarray(mspots)
-    #launch the GPU kernel
-    multispot[blocks_per_grid, threads_per_block](pGHx_gpu, pGHy_gpu, ghc_contig_gpu, mspots_gpu)
-    #convert mspots back to a cpu function
-    mspots_cpu = mspots_gpu.get()
-    spots[ispec] = mspots_cpu
-    #and do it again
-
-#def projection_matrix(ispec, nspec, iwave, nwave, spots, corners):
-#last function, parent function to all others
-#resides inside of ex2d_patch for now
-ny, nx = spots.shape[2:4]
-xc, yc = corners
-#for now
-ispec = 0
-iwave = 0
-#just do this before we get to gpu land (for now)
-xmin = np.min(xc[ispec:ispec+nspec, iwave:iwave+nwave])
-xmax = np.max(xc[ispec:ispec+nspec, iwave:iwave+nwave]) + nx
-ymin = np.min(yc[ispec:ispec+nspec, iwave:iwave+nwave])
-ymax = np.max(yc[ispec:ispec+nspec, iwave:iwave+nwave]) + ny
-A = np.zeros((ymax-ymin,xmax-xmin,nspec,nwave), dtype=np.float64)
-
-#this is a 2d kernel for projection matrix
-threads_per_block = (16,16) #needs to be 2d!
-#copy from matt who copied from cuda docs so it's probably legit
-blocks_per_grid_x = math.ceil(A.shape[0] / threads_per_block[0])
-blocks_per_grid_y = math.ceil(A.shape[1] / threads_per_block[1])
-blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
-
-#for niter compare cpu and gpu performance
-niter = 50
-
-#gpu 
-gpu_start = time.time()
-for i in range(niter):
-    #let numba do the data transfer work for us
-    projection_matrix[blocks_per_grid, threads_per_block](A, xc, yc, ispec, iwave, nspec, nwave, xmin, ymin, spots)
-gpu_end = time.time()
-gpu_time = gpu_end - gpu_start
-
-#cpu
-cpu_start = time.time()
-for i in range(niter):
-    A, ymin, xmin = projection_matrix_cpu(0, nspec, 0, nwave, spots, corners)
-cpu_end = time.time()
-cpu_time = cpu_end - cpu_start
-
-#now print some totals
-print("total gpu time for niter {} is {}".format(niter, gpu_time))
-print("total cpu time for niter {} is {}".format(niter, cpu_time))
-
-nypix, nxpix = A.shape[0:2]
-Ax = A.reshape(nypix*nxpix, nspec*nwave)
-image = Ax.dot(influx.ravel()).reshape(nypix, nxpix)
-#plt.imshow(image)
-#save image so we can check if we got the right answer....
-np.save('gpu_image.npy', image)
-
-#also save spots
-np.save('gpu_spots.npy', spots)
+assert np.allclose(A_cpu, A_gpu)
+assert np.allclose(A_gpu, A_gpu2)
