@@ -16,11 +16,7 @@ Use our special conda environment for running desi on the cpu:
 
 `source activate /global/common/software/m1759/desi/desi_cpu`
 
-`cd /global/common/software/m1759/desi`
-
-`source desi_libs.sh`
-
-`cd gpu_specter`
+`source /global/common/software/m1759/desi/source/desi_libs.sh`
 
 Branch should be `Hackathon`
 
